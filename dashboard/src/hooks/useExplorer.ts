@@ -36,6 +36,8 @@ export interface QueryResponse {
   rows: Record<string, unknown>[];
   row_count: number;
   elapsed_seconds: number;
+  limit_applied?: boolean;
+  default_limit?: number | null;
 }
 
 export interface ColumnMeta {

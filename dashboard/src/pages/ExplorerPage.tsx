@@ -339,6 +339,15 @@ export default function ExplorerPage() {
                       <Badge variant="outline" className="text-xs">
                         {queryResult.elapsed_seconds.toFixed(3)}s
                       </Badge>
+                      {queryResult.limit_applied && (
+                        <Badge
+                          variant="secondary"
+                          className="text-xs"
+                          title={`No LIMIT in query — auto-capped at ${queryResult.default_limit ?? 100} rows. Add an explicit LIMIT to override.`}
+                        >
+                          LIMIT {queryResult.default_limit ?? 100} applied
+                        </Badge>
+                      )}
                     </div>
                     {queryResult.columns.length > 0 && (
                       <div className="border rounded-md overflow-x-auto">
