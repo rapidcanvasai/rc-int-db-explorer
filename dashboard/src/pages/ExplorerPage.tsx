@@ -12,6 +12,7 @@ import { apiFetch } from '@/lib/apiClient';
 import QueryTabs from '@/components/QueryTabs';
 import StatusBar from '@/components/StatusBar';
 import TableTreeItem from '@/components/TableTreeItem';
+import ConfirmDangerModal from '@/components/ConfirmDangerModal';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
@@ -69,15 +70,34 @@ export default function ExplorerPage() {
     tables, activeTable, schema, data,
     isLoadingTables, isLoadingData, error,
     sortCol, sortOrder, offset, PAGE_SIZE, allSchemas, tableMetadata,
-    selectTable, toggleSort, paginate, runQuery, refreshMetadata,
+    selectTable, toggleSort, paginate, runQuery, refreshMetadata, dropTable,
   } = useExplorer();
 
   const [dark, toggleDark] = useDarkMode();
 
-  const [dbInfo, setDbInfo] = useState<{ host: string; database: string; env?: string } | null>(null);
+  const [dbInfo, setDbInfo] = useState<
+    { host: string; database: string; env?: string; destructive_ops_enabled?: boolean } | null
+  >(null);
   useEffect(() => {
     apiFetch('/api/info').then(r => r.ok ? r.json() : null).then(setDbInfo).catch(() => {});
   }, []);
+  const destructiveEnabled = !!dbInfo?.destructive_ops_enabled;
+
+  // Confirmation modal state. Two flavors:
+  //   - dropTable: triggered by trash icon on a sidebar row.
+  //   - query: triggered when the SQL editor submits a DELETE/DROP/TRUNCATE.
+  type Pending =
+    | { kind: 'dropTable'; table: string }
+    | { kind: 'query'; sql: string; firstWord: string };
+  const [pending, setPending] = useState<Pending | null>(null);
+  const [confirmBusy, setConfirmBusy] = useState(false);
+  const [confirmError, setConfirmError] = useState<string | null>(null);
+
+  const closeConfirm = useCallback(() => {
+    if (confirmBusy) return;
+    setPending(null);
+    setConfirmError(null);
+  }, [confirmBusy]);
 
   const env = (dbInfo?.env ?? '').toUpperCase();
   const envBadgeClass = env === 'PROD'
@@ -114,11 +134,9 @@ export default function ExplorerPage() {
 
   const groups = useMemo(() => groupTables(filteredTables), [filteredTables]);
 
-  const handleRun = useCallback(async () => {
+  const executeQuery = useCallback(async (sqlText: string) => {
     const tab = tabsCtl.activeTab;
     if (!tab) return;
-    const sqlText = tab.sql.trim();
-    if (!sqlText) return;
     tabsCtl.updateTab(tab.id, { isRunning: true, error: null });
     try {
       const res = await runQuery(sqlText);
@@ -126,13 +144,49 @@ export default function ExplorerPage() {
         isRunning: false, result: res, error: null, lastRunAt: Date.now(),
       });
       tabsCtl.recordHistory(sqlText, res);
+      // If we just dropped/deleted, refresh the sidebar so counts catch up.
+      if (res.kind === 'destructive') refreshMetadata(true);
     } catch (e) {
       tabsCtl.updateTab(tab.id, {
         isRunning: false, result: null,
         error: e instanceof Error ? e.message : 'Query failed',
       });
     }
-  }, [runQuery, tabsCtl]);
+  }, [runQuery, tabsCtl, refreshMetadata]);
+
+  const handleRun = useCallback(async () => {
+    const tab = tabsCtl.activeTab;
+    if (!tab) return;
+    const sqlText = tab.sql.trim();
+    if (!sqlText) return;
+    // Destructive prefixes get intercepted by the confirmation modal. Anything
+    // else (SELECT/SHOW/etc.) goes straight through.
+    const firstWord = sqlText.replace(/^\s+/, '').split(/\s+/)[0]?.toLowerCase() ?? '';
+    if (['delete', 'drop', 'truncate'].includes(firstWord)) {
+      setConfirmError(null);
+      setPending({ kind: 'query', sql: sqlText, firstWord });
+      return;
+    }
+    await executeQuery(sqlText);
+  }, [executeQuery, tabsCtl]);
+
+  const confirmPending = useCallback(async () => {
+    if (!pending) return;
+    setConfirmBusy(true);
+    setConfirmError(null);
+    try {
+      if (pending.kind === 'dropTable') {
+        await dropTable(pending.table);
+      } else {
+        await executeQuery(pending.sql);
+      }
+      setPending(null);
+    } catch (e) {
+      setConfirmError(e instanceof Error ? e.message : 'Operation failed');
+    } finally {
+      setConfirmBusy(false);
+    }
+  }, [pending, dropTable, executeQuery]);
 
   const totalRows = data?.total ?? 0;
   const currentPage = Math.floor(offset / PAGE_SIZE) + 1;
@@ -249,6 +303,11 @@ export default function ExplorerPage() {
                               meta={tableMetadata[t.TABLE_NAME]}
                               isActive={activeTable === t.TABLE_NAME}
                               onSelect={selectTable}
+                              canDrop={destructiveEnabled}
+                              onRequestDrop={name => {
+                                setConfirmError(null);
+                                setPending({ kind: 'dropTable', table: name });
+                              }}
                             />
                           ))}
                         </div>
@@ -335,9 +394,15 @@ export default function ExplorerPage() {
                       <h2 className="text-sm font-semibold">
                         {activeTab?.name ?? 'Query'} · Results
                       </h2>
-                      <Badge variant="outline" className="text-xs">
-                        {formatNum(queryResult.row_count)} rows
-                      </Badge>
+                      {queryResult.kind === 'destructive' ? (
+                        <Badge variant="outline" className="text-xs text-destructive border-destructive/40">
+                          {formatNum(queryResult.affected_rows ?? 0)} rows affected
+                        </Badge>
+                      ) : (
+                        <Badge variant="outline" className="text-xs">
+                          {formatNum(queryResult.row_count)} rows
+                        </Badge>
+                      )}
                       <Badge variant="outline" className="text-xs">
                         {queryResult.elapsed_seconds.toFixed(3)}s
                       </Badge>
@@ -528,6 +593,35 @@ export default function ExplorerPage() {
         activeTableRows={schema?.row_count}
         lastQuery={lastQueryStatus}
         errorText={error}
+      />
+
+      <ConfirmDangerModal
+        open={!!pending}
+        title={
+          pending?.kind === 'dropTable'
+            ? `Drop table "${pending.table}"?`
+            : `Run ${pending?.firstWord.toUpperCase() ?? ''} query?`
+        }
+        description={
+          pending?.kind === 'dropTable'
+            ? `This will permanently drop the table "${pending.table}" from "${dbInfo?.database ?? 'the database'}" (${(dbInfo?.env ?? '').toUpperCase()}). All rows, indexes, and structure will be lost.`
+            : `You are about to run a ${pending?.firstWord.toUpperCase() ?? ''} statement against "${dbInfo?.database ?? 'the database'}" (${(dbInfo?.env ?? '').toUpperCase()}). This will modify data and cannot be undone.`
+        }
+        sqlPreview={
+          pending?.kind === 'dropTable'
+            ? `DROP TABLE \`${pending.table}\`;`
+            : pending?.sql
+        }
+        confirmPhrase={
+          pending?.kind === 'dropTable' ? pending.table : 'DELETE'
+        }
+        confirmLabel={
+          pending?.kind === 'dropTable' ? 'Drop table' : 'Run query'
+        }
+        isBusy={confirmBusy}
+        errorText={confirmError}
+        onConfirm={confirmPending}
+        onCancel={closeConfirm}
       />
     </div>
   );

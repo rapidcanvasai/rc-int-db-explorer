@@ -34,7 +34,7 @@ A lightweight, DataGrip-style web UI for browsing read-only MySQL databases. Fas
 - **Tabbed query editor** — multiple named tabs, per-tab results, `Cmd+T` new, `Cmd+W` close, `Cmd+1‥9` jump. Persisted to localStorage.
 - **Query history** — last 100 queries with timing, one click to re-run.
 - **Dark mode** + draggable sidebar/editor splits, persisted.
-- **Read-only by design** — only `SELECT`, `SHOW`, `DESCRIBE`, `EXPLAIN` are allowed by the backend.
+- **Read-only by design** — only `SELECT`, `SHOW`, `DESCRIBE`, `EXPLAIN` are allowed by the backend. Destructive ops (`DELETE` / `DROP` / `TRUNCATE`) are gated behind a feature flag + confirmation modal (see [Destructive operations](#destructive-operations-opt-in)).
 - **Env identification** — a bold `LOCAL` / `DEV` / `PROD` badge in the header so it's hard to confuse environments.
 
 ## Quickstart (local)
@@ -135,10 +135,41 @@ docker-compose.yml     bundled MySQL for local dev
 Makefile
 ```
 
+## Destructive operations (opt-in)
+
+`DELETE`, `DROP`, and `TRUNCATE` are disabled by default. Flip them on per environment by setting `DESTRUCTIVE_OPS_ENABLED=true` in the matching `app/.env.*` file (`true` / `1` / `yes` all work).
+
+When enabled, the backend exposes:
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/api/query` | Now accepts `DELETE` / `DROP` / `TRUNCATE` in addition to read-only verbs. Response includes `kind: "destructive"` and `affected_rows`. |
+| `DELETE` | `/api/tables/{name}` | `DROP TABLE \`name\``. |
+| `DELETE` | `/api/tables/{name}/rows` | `DELETE FROM \`name\` [WHERE …]`. JSON body `{"where": "id = 42"}` is optional; omitting it deletes every row. Semicolons in `where` are rejected. |
+
+`/api/info` exposes `destructive_ops_enabled` so the UI only renders the affordances the backend actually honours.
+
+**The UI never sends a destructive request silently.** Every path — the trash icon on a sidebar row, and any destructive SQL typed into the editor — opens a red `ConfirmDangerModal` that requires the user to type the table name (drops) or the literal `DELETE` (queries) before the destructive button enables.
+
+Defense in depth (recommended):
+
+1. Keep the flag off in environments you never want to mutate.
+2. Use a DB user with only the privileges you want exposed (e.g., grant `DELETE` on specific tables, withhold `DROP` entirely).
+3. Audit usage at the DB level — every destructive call is a normal MySQL statement.
+
 ## Safety
 
-- The backend rejects anything other than `SELECT`, `SHOW`, `DESCRIBE`, `EXPLAIN` (see `app/main.py` → `validate_readonly`). Use a read-only DB user in addition for defense in depth.
+- The backend rejects anything other than `SELECT`, `SHOW`, `DESCRIBE`, `EXPLAIN` (see `app/main.py` → `validate_query_allowed`). With `DESTRUCTIVE_OPS_ENABLED=true`, `DELETE` / `DROP` / `TRUNCATE` are additionally allowed — every other verb (`INSERT`, `UPDATE`, `ALTER`, `GRANT`, …) is still rejected. Use a least-privilege DB user in addition for defense in depth.
 - Real secrets never live in git — see `.gitignore`. Templates end in `.example`.
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest tests/
+```
+
+Covers the destructive-ops flag gate at `/api/query` and the dedicated endpoints, identifier and `WHERE`-clause sanitization, and the SQL classifier.
 
 ## License
 

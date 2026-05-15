@@ -9,6 +9,7 @@ import os
 import re
 import time
 from contextlib import asynccontextmanager, contextmanager
+from typing import Optional
 from urllib.parse import urlparse
 
 from mysql.connector import Error as MySQLError, pooling
@@ -55,6 +56,18 @@ def get_db_config() -> dict:
 
 DB_CONFIG = get_db_config()
 
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+# Feature flag — when on, the API exposes DELETE/DROP affordances.
+# Always require an explicit opt-in; the UI will still demand user confirmation.
+DESTRUCTIVE_OPS_ENABLED = _env_flag("DESTRUCTIVE_OPS_ENABLED", default=False)
+
 # Lazy pool — created on app startup, not at import time
 _pool = None
 
@@ -89,21 +102,66 @@ def get_cursor(dictionary=True):
         conn.close()
 
 
+@contextmanager
+def get_connection():
+    """Like get_cursor but exposes the connection so callers can commit()."""
+    try:
+        conn = _get_pool().get_connection()
+    except Exception as e:
+        logger.error(f"Failed to get DB connection: {e}")
+        raise HTTPException(status_code=503, detail=f"Database unavailable: {e}")
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Read-only SQL guard
 # ---------------------------------------------------------------------------
 
-ALLOWED_PREFIXES = ("select", "show", "describe", "desc", "explain")
+READONLY_PREFIXES = ("select", "show", "describe", "desc", "explain")
+DESTRUCTIVE_PREFIXES = ("delete", "drop", "truncate")
 
 
-def validate_readonly(sql: str):
+def _first_word(sql: str) -> str:
     stripped = sql.strip().rstrip(";").strip()
-    first_word = stripped.split()[0].lower() if stripped.split() else ""
-    if first_word not in ALLOWED_PREFIXES:
-        raise HTTPException(
-            status_code=403,
-            detail=f"Only read-only queries allowed (SELECT, SHOW, DESCRIBE, EXPLAIN). Got: {first_word.upper()}",
-        )
+    parts = stripped.split()
+    return parts[0].lower() if parts else ""
+
+
+def classify_query(sql: str) -> str:
+    """Return 'readonly', 'destructive', or 'other' for the SQL's first keyword."""
+    word = _first_word(sql)
+    if word in READONLY_PREFIXES:
+        return "readonly"
+    if word in DESTRUCTIVE_PREFIXES:
+        return "destructive"
+    return "other"
+
+
+def validate_query_allowed(sql: str):
+    kind = classify_query(sql)
+    if kind == "readonly":
+        return kind
+    if kind == "destructive":
+        if not DESTRUCTIVE_OPS_ENABLED:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Destructive queries are disabled. Set DESTRUCTIVE_OPS_ENABLED=true "
+                    "on the backend to allow DELETE/DROP/TRUNCATE."
+                ),
+            )
+        return kind
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            "Only SELECT/SHOW/DESCRIBE/EXPLAIN are allowed"
+            + (" (plus DELETE/DROP/TRUNCATE when enabled)." if DESTRUCTIVE_OPS_ENABLED else ".")
+            + f" Got: {_first_word(sql).upper() or '<empty>'}"
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +205,7 @@ def db_info():
         "database": DB_CONFIG["database"],
         "port": DB_CONFIG["port"],
         "env": (os.getenv("APP_ENV") or "LOCAL").upper(),
+        "destructive_ops_enabled": DESTRUCTIVE_OPS_ENABLED,
     }
 
 
@@ -342,16 +401,26 @@ def run_query(body: dict):
     sql = body.get("sql", "").strip()
     if not sql:
         raise HTTPException(status_code=400, detail="Empty query")
-    validate_readonly(sql)
+    kind = validate_query_allowed(sql)
 
-    effective_sql, limit_applied = _apply_default_limit(sql)
+    if kind == "readonly":
+        effective_sql, limit_applied = _apply_default_limit(sql)
+    else:
+        effective_sql, limit_applied = sql, False
 
     t0 = time.time()
     try:
-        with get_cursor() as cur:
-            cur.execute(effective_sql)
-            rows = cur.fetchall()
-            col_names = [d[0] for d in cur.description] if cur.description else []
+        with get_connection() as conn:
+            cur = conn.cursor(dictionary=True)
+            try:
+                cur.execute(effective_sql)
+                rows = cur.fetchall() if cur.with_rows else []
+                col_names = [d[0] for d in cur.description] if cur.description else []
+                affected = cur.rowcount
+                if kind == "destructive":
+                    conn.commit()
+            finally:
+                cur.close()
     except MySQLError as e:
         # Surface MySQL errors (unknown column, syntax, etc.) as JSON 400 so the
         # UI can display them instead of FastAPI's default plain-text 500.
@@ -369,6 +438,79 @@ def run_query(body: dict):
         "elapsed_seconds": elapsed,
         "limit_applied": limit_applied,
         "default_limit": DEFAULT_QUERY_LIMIT if limit_applied else None,
+        "kind": kind,
+        "affected_rows": affected if kind == "destructive" else None,
+    }
+
+
+def _require_destructive_enabled():
+    if not DESTRUCTIVE_OPS_ENABLED:
+        raise HTTPException(
+            status_code=403,
+            detail="Destructive ops disabled. Set DESTRUCTIVE_OPS_ENABLED=true on the backend.",
+        )
+
+
+@app.delete("/api/tables/{name}")
+def drop_table(name: str):
+    """DROP TABLE — feature-flagged. Front-end must show confirmation modal."""
+    _require_destructive_enabled()
+    _validate_table_name(name)
+    t0 = time.time()
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(f"DROP TABLE `{name}`")
+                conn.commit()
+            finally:
+                cur.close()
+    except MySQLError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {
+        "table": name,
+        "action": "drop_table",
+        "elapsed_seconds": round(time.time() - t0, 3),
+    }
+
+
+@app.delete("/api/tables/{name}/rows")
+def delete_rows(name: str, body: Optional[dict] = None):
+    """DELETE FROM <table> [WHERE ...] — feature-flagged. Body may include {where: str}.
+
+    If `where` is omitted the call deletes every row (TRUNCATE semantics).
+    The UI must collect explicit user confirmation before invoking either form.
+    """
+    _require_destructive_enabled()
+    _validate_table_name(name)
+    where = (body or {}).get("where", "").strip()
+
+    sql = f"DELETE FROM `{name}`"
+    if where:
+        # Disallow nested statements; the WHERE clause is executed verbatim, so
+        # ban semicolons rather than try to parse user-supplied SQL.
+        if ";" in where:
+            raise HTTPException(status_code=400, detail="WHERE clause may not contain ';'")
+        sql += f" WHERE {where}"
+
+    t0 = time.time()
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(sql)
+                affected = cur.rowcount
+                conn.commit()
+            finally:
+                cur.close()
+    except MySQLError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {
+        "table": name,
+        "action": "delete_rows",
+        "where": where or None,
+        "affected_rows": affected,
+        "elapsed_seconds": round(time.time() - t0, 3),
     }
 
 

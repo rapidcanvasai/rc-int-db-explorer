@@ -38,6 +38,8 @@ export interface QueryResponse {
   elapsed_seconds: number;
   limit_applied?: boolean;
   default_limit?: number | null;
+  kind?: 'readonly' | 'destructive';
+  affected_rows?: number | null;
 }
 
 export interface ColumnMeta {
@@ -183,10 +185,29 @@ export function useExplorer() {
     return await res.json();
   }, []);
 
+  const dropTable = useCallback(async (name: string) => {
+    const res = await apiFetch(`/api/tables/${encodeURIComponent(name)}`, {
+      method: 'DELETE',
+    });
+    if (!res.ok) {
+      const raw = await res.text().catch(() => '');
+      let detail = '';
+      try { detail = JSON.parse(raw)?.detail ?? ''; } catch { detail = raw; }
+      throw new Error(detail || res.statusText || `HTTP ${res.status}`);
+    }
+    if (activeTable === name) {
+      setActiveTable(null);
+      setSchema(null);
+      setData(null);
+    }
+    await refreshMetadata(true);
+    return await res.json();
+  }, [activeTable, refreshMetadata]);
+
   return {
     tables, activeTable, schema, data,
     isLoadingTables, isLoadingData, error,
     sortCol, sortOrder, offset, PAGE_SIZE, allSchemas, tableMetadata,
-    selectTable, toggleSort, paginate, runQuery, refreshMetadata,
+    selectTable, toggleSort, paginate, runQuery, refreshMetadata, dropTable,
   };
 }
