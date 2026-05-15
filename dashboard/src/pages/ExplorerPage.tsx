@@ -140,7 +140,9 @@ export default function ExplorerPage() {
 
   const activeTab = tabsCtl.activeTab;
   const queryResult = activeTab?.result ?? null;
-  const queryError = activeTab?.error ?? null;
+  // Treat empty string as no-error — otherwise the `queryResult || queryError`
+  // check below silently falls through to the table-browser pane.
+  const queryError = activeTab?.error || null;
 
   const lastQueryStatus = queryResult
     ? { rowCount: queryResult.row_count, elapsedSeconds: queryResult.elapsed_seconds, ts: activeTab?.lastRunAt ?? Date.now() }

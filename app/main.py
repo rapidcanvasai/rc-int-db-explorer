@@ -11,7 +11,7 @@ import time
 from contextlib import asynccontextmanager, contextmanager
 from urllib.parse import urlparse
 
-from mysql.connector import pooling
+from mysql.connector import Error as MySQLError, pooling
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -347,10 +347,15 @@ def run_query(body: dict):
     effective_sql, limit_applied = _apply_default_limit(sql)
 
     t0 = time.time()
-    with get_cursor() as cur:
-        cur.execute(effective_sql)
-        rows = cur.fetchall()
-        col_names = [d[0] for d in cur.description] if cur.description else []
+    try:
+        with get_cursor() as cur:
+            cur.execute(effective_sql)
+            rows = cur.fetchall()
+            col_names = [d[0] for d in cur.description] if cur.description else []
+    except MySQLError as e:
+        # Surface MySQL errors (unknown column, syntax, etc.) as JSON 400 so the
+        # UI can display them instead of FastAPI's default plain-text 500.
+        raise HTTPException(status_code=400, detail=str(e))
     elapsed = round(time.time() - t0, 3)
 
     cleaned = []

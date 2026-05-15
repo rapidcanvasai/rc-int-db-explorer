@@ -166,8 +166,17 @@ export function useExplorer() {
       body: JSON.stringify({ sql }),
     });
     if (!res.ok) {
-      const err = await res.json().catch(() => ({ detail: res.statusText }));
-      throw new Error(err.detail || res.statusText);
+      // Body may be JSON (`{detail: "..."}`) or plain text. statusText is
+      // empty under HTTP/2, so always fall back to a non-empty message —
+      // otherwise the UI treats the failure as no-error and hides it.
+      const raw = await res.text().catch(() => '');
+      let detail = '';
+      try {
+        detail = JSON.parse(raw)?.detail ?? '';
+      } catch {
+        detail = raw;
+      }
+      throw new Error(detail || res.statusText || `HTTP ${res.status}`);
     }
     return await res.json();
   }, []);
