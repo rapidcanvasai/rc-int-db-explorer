@@ -158,3 +158,48 @@ def test_env_flag_parsing():
 
     assert main._env_flag("UNSET_VAR", default=False) is False
     assert main._env_flag("UNSET_VAR", default=True) is True
+
+
+# ---------------------------------------------------------------------------
+# PROD hard-disable
+# ---------------------------------------------------------------------------
+
+def test_prod_forces_destructive_ops_off(fake_db, monkeypatch):
+    """Even with the flag explicitly on, APP_ENV=PROD must disable it."""
+    import importlib
+    monkeypatch.setenv("APP_ENV", "PROD")
+    monkeypatch.setenv("DESTRUCTIVE_OPS_ENABLED", "true")
+    import app.main as main
+    importlib.reload(main)
+    # Re-apply the fake DB after reload — the module-level get_cursor/get_connection
+    # references were rebuilt.
+    from contextlib import contextmanager
+
+    @contextmanager
+    def fake_get_cursor(dictionary=True):
+        class _C:
+            with_rows = False
+            description = None
+            rowcount = 0
+            def execute(self, *a, **kw): pass
+            def fetchall(self): return []
+            def fetchone(self): return None
+            def close(self): pass
+        yield _C()
+
+    monkeypatch.setattr(main, "get_cursor", fake_get_cursor)
+
+    assert main.APP_ENV == "PROD"
+    assert main.DESTRUCTIVE_OPS_ENABLED is False
+
+    from fastapi.testclient import TestClient
+    with TestClient(main.app) as client:
+        info = client.get("/api/info").json()
+        assert info["env"] == "PROD"
+        assert info["destructive_ops_enabled"] is False
+
+        res = client.post("/api/query", json={"sql": "DELETE FROM widgets"})
+        assert res.status_code == 403
+
+        res = client.delete("/api/tables/widgets")
+        assert res.status_code == 403

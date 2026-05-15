@@ -139,6 +139,8 @@ Makefile
 
 `DELETE`, `DROP`, and `TRUNCATE` are disabled by default. Flip them on per environment by setting `DESTRUCTIVE_OPS_ENABLED=true` in the matching `app/.env.*` file (`true` / `1` / `yes` all work).
 
+> **PROD is hard-disabled.** If `APP_ENV=PROD`, the backend forces the flag to off regardless of `DESTRUCTIVE_OPS_ENABLED` — destructive operations cannot be enabled on the production tenant from this app.
+
 When enabled, the backend exposes:
 
 | Method | Path | Purpose |
