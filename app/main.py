@@ -325,7 +325,7 @@ def table_data(
     }
 
 
-DEFAULT_QUERY_LIMIT = 100
+DEFAULT_QUERY_LIMIT = 1000
 
 
 def _apply_default_limit(sql: str) -> tuple[str, bool]:
